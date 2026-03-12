@@ -13,6 +13,8 @@
 
 > 一个单文件 `worker.js` 项目：统一多台 Emby 节点入口、隐藏源站 IP、支持直连/反代混合策略、提供 `/admin` 可视化后台，并集成日志、Cloudflare 统计、Telegram 日报与多层缓存优化。
 
+<img width="2560" height="2497" alt="图片" src="https://github.com/user-attachments/assets/9348e71f-bf9f-47c4-944d-7f94d0d6bdde" />
+
 
  - 讨论群：https://t.me/+NhDf7qMxH4ZlODY9
  - 这是一个面向个人的Worker 代理方案，对于家庭来说免费版worker请求数可能不够用
