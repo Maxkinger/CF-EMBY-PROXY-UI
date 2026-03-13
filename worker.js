@@ -1,8 +1,5 @@
 // EMBY-PROXY-UI V18.1 (SaaS UI Optimized - Ultimate Fix + Emby Auth Patch)
-// 终极修复：彻底解决 POST 导致 WAF/Emby 报错，拔除所有视频节流冗余代码，无损 URL 穿透
-// 补丁集成：Emby 授权头双向兼容、登录 API 补头、轻量 403 重试、协议 Fallback
-// 数据面板升级：支持 Cloudflare Analytics 聚合、时间锥、以及全场景“资源类别”徽章解析
-//
+
 // 单文件导航图（保持单文件部署，不做物理解耦）：
 // 0. 全局状态与通用工具
 // 1. Auth：管理员认证与 JWT
@@ -22,6 +19,57 @@
 // - runtime status：写入 `sys:ops_status:v1` 的运行状态面板数据，用于“可解释观测”，不是强审计日志。
 // - smoke：高频快速验收回归，只覆盖核心链路；full：包含 smoke + 扩展运维状态验证。
 // - thin dispatcher：只做解析、归一、派发，不承载业务复杂度的入口层，例如 `handleApi`。
+
+/**
+ * @typedef {{
+ *   get(key: string, options?: { type?: string }): Promise<any>,
+ *   put(key: string, value: string): Promise<void>,
+ *   delete(key: string): Promise<void>,
+ *   list(options?: { prefix?: string }): Promise<{ keys: Array<{ name: string }> }>
+ * }} KVNamespaceLike
+ *
+ * @typedef {{ waitUntil(promise: Promise<any>): void }} ExecutionContextLike
+ *
+ * @typedef {{
+ *   success?: boolean,
+ *   ok?: boolean,
+ *   description?: string,
+ *   errors?: Array<{ message?: string }>,
+ *   result?: any,
+ *   result_info?: { total_pages?: number, totalPages?: number },
+ *   data?: {
+ *     viewer?: {
+ *       zones?: any[],
+ *       accounts?: any[]
+ *     }
+ *   }
+ * }} JsonApiEnvelope
+ *
+ * @typedef {{
+ *   reason?: string,
+ *   section?: string,
+ *   actor?: string,
+ *   source?: string,
+ *   note?: string
+ * }} ConfigSnapshotMeta
+ *
+ * @typedef {{
+ *   kv?: KVNamespaceLike | null,
+ *   ctx?: ExecutionContextLike | null,
+ *   invalidateList?: boolean
+ * }} PersistNodesIndexOptions
+ *
+ * @typedef {{
+ *   env?: any,
+ *   kv?: KVNamespaceLike | null,
+ *   ctx?: ExecutionContextLike | null,
+ *   snapshotMeta?: ConfigSnapshotMeta
+ * }} PersistRuntimeConfigOptions
+ *
+ * @typedef {RequestInit & { cf?: { cacheEverything: boolean, cacheTtl: number } }} WorkerRequestInit
+ * @typedef {Response & { webSocket?: unknown }} UpgradeableResponse
+ * @typedef {Error & { code?: string, status?: number }} AppError
+ */
 
 // ============================================================================
 // 0. 全局配置与状态 (GLOBAL CONFIG & STATE)
@@ -311,6 +359,7 @@ async function fetchCloudflareApiJson(url, apiToken) {
     headers: { "Authorization": `Bearer ${apiToken}`, "Content-Type": "application/json" }
   });
   if (!res.ok) throw new Error(`cf_api_http_${res.status}`);
+  /** @type {JsonApiEnvelope} */
   const payload = await res.json();
   if (payload?.success === false) {
     const msg = Array.isArray(payload?.errors) ? payload.errors.map(item => item?.message).filter(Boolean).join("; ") : "";
@@ -329,6 +378,7 @@ async function fetchCloudflareGraphQL(apiToken, query, variables) {
     body: JSON.stringify(body)
   });
   if (!cfRes.ok) throw new Error(`cf_graphql_http_${cfRes.status}`);
+  /** @type {JsonApiEnvelope} */
   const cfData = await cfRes.json();
   if (Array.isArray(cfData?.errors) && cfData.errors.length) {
     throw new Error(cfData.errors.map(item => item?.message).filter(Boolean).join("; ") || "cf_graphql_error");
@@ -1074,6 +1124,10 @@ const Database = {
     GLOBALS.NodesIndexCache = { data: index, exp: nowMs() + 60000 };
     return [...index];
   },
+  /**
+   * @param {string | string[]} [nodeNames=[]]
+   * @param {{ invalidateList?: boolean }} [options={}]
+   */
   invalidateNodeCaches(nodeNames = [], options = {}) {
     for (const rawName of Array.isArray(nodeNames) ? nodeNames : [nodeNames]) {
       const name = String(rawName || "").toLowerCase().trim();
@@ -1082,7 +1136,12 @@ const Database = {
     }
     if (options.invalidateList) GLOBALS.NodesListCache = null;
   },
-  async persistNodesIndex(index, { kv, ctx, invalidateList = false } = {}) {
+  /**
+   * @param {string[]} index
+   * @param {PersistNodesIndexOptions} [options={}]
+   */
+  async persistNodesIndex(index, options = {}) {
+    const { kv, ctx, invalidateList = false } = options;
     const normalizedIndex = this.normalizeNodeIndex(index);
     GLOBALS.NodesIndexCache = { data: normalizedIndex, exp: nowMs() + 60000 };
     if (invalidateList) GLOBALS.NodesListCache = null;
@@ -1105,7 +1164,11 @@ const Database = {
     }
     return [...staleKeys].filter(Boolean);
   },
+  /**
+   * @param {ConfigSnapshotMeta} [meta={}]
+   */
   normalizeConfigSnapshotMeta(meta = {}) {
+    /** @type {ConfigSnapshotMeta} */
     const input = meta && typeof meta === "object" ? meta : {};
     return {
       reason: String(input.reason || "save_config").trim() || "save_config",
@@ -1163,7 +1226,12 @@ const Database = {
     await kv.put(this.CONFIG_SNAPSHOTS_KEY, JSON.stringify(nextSnapshots));
     return snapshot;
   },
-  async persistRuntimeConfig(rawConfig, { env, kv, ctx, snapshotMeta } = {}) {
+  /**
+   * @param {any} rawConfig
+   * @param {PersistRuntimeConfigOptions} [options={}]
+   */
+  async persistRuntimeConfig(rawConfig, options = {}) {
+    const { env, kv, ctx, snapshotMeta } = options;
     if (!kv) return sanitizeRuntimeConfig(rawConfig);
     const prevConfig = env
       ? await getRuntimeConfig(env)
@@ -1189,6 +1257,7 @@ const Database = {
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify({ chat_id: chatId, text: String(text || "") })
       });
+      /** @type {JsonApiEnvelope} */
       const tgData = await res.json();
       if (!tgData.ok) throw new Error(tgData.description || "Telegram API 返回错误");
       return tgData;
@@ -2206,6 +2275,7 @@ const Proxy = {
       return { response, targetBase, finalUrl };
     } catch (error) {
       if (timeoutMs > 0 && (error?.name === "AbortError" || String(error?.message || "").toLowerCase().includes("abort"))) {
+        /** @type {AppError} */
         const timeoutError = new Error(`upstream_timeout_${timeoutMs}ms`);
         timeoutError.code = "UPSTREAM_TIMEOUT";
         throw timeoutError;
@@ -2369,6 +2439,7 @@ const Proxy = {
       }
 
       // [预热修复] 3. 当命中预热探测时，真正命令 Cloudflare 边缘节点进行缓存
+      /** @type {WorkerRequestInit} */
       const fetchOptions = { 
         method: effectiveMethod, 
         headers, 
@@ -2514,11 +2585,13 @@ const Proxy = {
 
                 const prefetchRange = `bytes=${prefetchStart}-${prefetchEnd}`;
                 const prefetchOptions = await buildFetchOptions(finalUrl, { method: "GET" });
-                prefetchOptions.headers.set("Range", prefetchRange);
+                const prefetchHeaders = new Headers(prefetchOptions.headers);
+                prefetchOptions.headers = prefetchHeaders;
+                prefetchHeaders.set("Range", prefetchRange);
                 // 去掉可能影响缓存/命中的条件请求头
-                prefetchOptions.headers.delete("If-Modified-Since");
-                prefetchOptions.headers.delete("If-None-Match");
-                prefetchOptions.headers.set("X-Prewarm-Prefetch", "1");
+                prefetchHeaders.delete("If-Modified-Since");
+                prefetchHeaders.delete("If-None-Match");
+                prefetchHeaders.set("X-Prewarm-Prefetch", "1");
 
                 const prefetchRes = await fetch(finalUrl.toString(), prefetchOptions);
                 try {
@@ -2535,13 +2608,17 @@ const Proxy = {
 
       const finalStatus = directRedirectStatus || response.status;
       const finalStatusText = directRedirectStatus ? "Temporary Redirect" : response.statusText;
-      if (!directRedirectStatus && response.status === 101 && response.webSocket) {
-        return new Response(null, {
+      /** @type {UpgradeableResponse} */
+      const upgradeResponse = response;
+      if (!directRedirectStatus && response.status === 101 && upgradeResponse.webSocket) {
+        /** @type {ResponseInit & { webSocket?: unknown }} */
+        const upgradeInit = {
           status: 101,
           statusText: response.statusText,
           headers: modifiedHeaders,
-          webSocket: response.webSocket
-        });
+          webSocket: upgradeResponse.webSocket
+        };
+        return new Response(null, upgradeInit);
       }
       return new Response(directRedirectStatus ? null : response.body, {
         status: finalStatus,
@@ -2889,7 +2966,7 @@ const UI_HTML = `<!DOCTYPE html>
                   <label class="flex items-center text-sm font-medium mb-2 cursor-pointer text-slate-900 dark:text-white"><input type="checkbox" id="cfg-dashboard-auto-refresh" class="mr-2 w-4 h-4 rounded"> 开启 Dashboard 自动刷新</label>
                   <p class="text-xs text-slate-500 mb-3 ml-6">启用后，仪表盘会按设定周期自动重拉“统计面板 + 运行状态”。适合值班看板；如果你的 cron 很少跑，建议把周期设得保守一些。</p>
                   <label class="block text-sm text-slate-500 mb-1 ml-6">自动刷新周期（秒）</label>
-                  <input type="number" min="5" step="5" id="cfg-dashboard-auto-refresh-seconds" class="w-full md:w-1/2 p-2 ml-6 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white" value="30">
+                  <input type="number" min="5" step="5" id="cfg-dashboard-auto-refresh-seconds" class="w-[calc(100%-1.5rem)] md:w-1/2 p-2 ml-6 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white" value="30">
                   <p class="text-xs text-slate-500 ml-6">推荐 30 到 60 秒；过短会放大控制台请求频率。</p>
                 </div>
                 <button onclick="App.saveSettings('ui')" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition">保存 UI 策略</button>
@@ -2910,9 +2987,9 @@ const UI_HTML = `<!DOCTYPE html>
                 <label class="flex items-center text-sm font-medium mb-2 cursor-pointer text-slate-900 dark:text-white"><input type="checkbox" id="cfg-enable-prewarm" class="mr-2 w-4 h-4 rounded" checked> 开启视频起播预热拦截</label>
                 <p class="text-xs text-slate-500 mb-3 ml-6">精准拦截播放器起播时的探测请求，利用 Cloudflare 边缘节点进行微型缓存，极大提升起播速度并保护源站。</p>
                 <label class="block text-sm text-slate-500 mb-1 ml-6">预热微缓存时长 (秒)</label>
-                <input type="number" id="cfg-prewarm-ttl" class="w-full md:w-1/2 p-2 ml-6 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-4 dark:text-white" value="180">
+                <input type="number" id="cfg-prewarm-ttl" class="w-[calc(100%-1.5rem)] md:w-1/2 p-2 ml-6 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-4 dark:text-white" value="180">
                 <label class="block text-sm text-slate-500 mb-1 ml-6">预热旁路预取字节数</label>
-                <input type="number" min="0" step="65536" id="cfg-prewarm-prefetch-bytes" class="w-full md:w-1/2 p-2 ml-6 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white" value="4194304">
+                <input type="number" min="0" step="65536" id="cfg-prewarm-prefetch-bytes" class="w-[calc(100%-1.5rem)] md:w-1/2 p-2 ml-6 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white" value="4194304">
                 <p class="text-xs text-slate-500 mb-4 ml-6">控制命中起播探测后，后台额外预取多少后续 Range 数据。填 0 表示仅做首个探测缓存，不做旁路预取。</p>
                 <h3 class="font-bold mb-2 mt-6 text-slate-900 dark:text-white">跳转代理开关</h3>
                 <label class="flex items-center text-sm font-medium mb-2 cursor-pointer text-slate-900 dark:text-white"><input type="checkbox" id="cfg-source-same-origin-proxy" class="mr-2 w-4 h-4 rounded" checked> 默认开启：源站和同源跳转代理</label>
